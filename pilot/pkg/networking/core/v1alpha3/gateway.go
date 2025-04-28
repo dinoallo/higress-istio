@@ -79,11 +79,12 @@ type MutableGatewayListener struct {
 // TODO: given how tightly tied listener.FilterChains, opts.filterChainOpts, and mutable.FilterChains
 // are to each other we should encapsulate them some way to ensure they remain consistent (mainly that
 // in each an index refers to the same chain).
-func (ml *MutableGatewayListener) build(builder *ListenerBuilder, opts gatewayListenerOpts) error {
+
+func (ml *MutableGatewayListener) build(builder *ListenerBuilder, opts gatewayListenerOpts) ([][]*envoyfilter.MessageIndex, error) {
 	if len(opts.filterChainOpts) == 0 {
-		return fmt.Errorf("must have more than 0 chains in listener %q", ml.Listener.Name)
+		return nil, fmt.Errorf("must have more than 0 chains in listener %q", ml.Listener.Name)
 	}
-	httpConnectionManagers := make([]*hcm.HttpConnectionManager, len(ml.FilterChains))
+	httpConnectionManagers := make([][]*envoyfilter.MessageIndex, len(ml.FilterChains))
 	for i := range ml.FilterChains {
 		chain := ml.FilterChains[i]
 		opt := opts.filterChainOpts[i]
@@ -109,6 +110,10 @@ func (ml *MutableGatewayListener) build(builder *ListenerBuilder, opts gatewayLi
 			} else {
 				ml.Listener.FilterChains[i].Filters = append(ml.Listener.FilterChains[i].Filters, chain.TCP...)
 			}
+			httpConnectionManagers[i] = make([]*envoyfilter.MessageIndex, 0)
+			for j := 0; j < len(ml.Listener.FilterChains[i].Filters); j++ {
+				httpConnectionManagers[i] = append(httpConnectionManagers[i], envoyfilter.NewMessageIndex())
+			}
 			log.Debugf("attached %d network filters to listener %q filter chain %d", len(chain.TCP)+len(opt.networkFilters), ml.Listener.Name, i)
 		} else {
 			// Add the TCP filters first.. and then the HTTP connection manager.
@@ -124,23 +129,25 @@ func (ml *MutableGatewayListener) build(builder *ListenerBuilder, opts gatewayLi
 			if opts.port != nil {
 				opt.httpOpts.port = opts.port.Port
 			}
-			httpConnectionManagers[i] = builder.buildHTTPConnectionManager(opt.httpOpts)
+			httpConnectionManager := builder.buildHTTPConnectionManager(opt.httpOpts)
 			filter := &listener.Filter{
 				Name:       wellknown.HTTPConnectionManager,
-				ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(httpConnectionManagers[i])},
+				ConfigType: &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(httpConnectionManager)},
 			}
 			ml.Listener.FilterChains[i].Filters = append(ml.Listener.FilterChains[i].Filters, filter)
+			httpConnectionManagers[i] = make([]*envoyfilter.MessageIndex, len(ml.Listener.FilterChains[i].Filters))
+			httpConnectionManagers[i][len(httpConnectionManagers[i])-1] = envoyfilter.NewMessageIndex()
 			log.Debugf("attached HTTP filter with %d http_filter options to listener %q filter chain %d",
-				len(httpConnectionManagers[i].HttpFilters), ml.Listener.Name, i)
+				len(httpConnectionManager.HttpFilters), ml.Listener.Name, i)
 		}
 	}
 
-	return nil
+	return httpConnectionManagers, nil
 }
 
-// Modified by Higress
 func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBuilder, req *model.PushRequest, efKeys []string) (*ListenerBuilder, cacheStats) {
 	listeners := make([]*listener.Listener, 0)
+	http_listeners := make([][][]*envoyfilter.MessageIndex, 0)
 	if builder.node.MergedGateway == nil {
 		log.Debugf("buildGatewayListeners: no gateways for router %v", builder.node.ID)
 		return builder, cacheStats{}
@@ -273,10 +280,17 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 			}
 			gatewaysByListenerName[lname] = gateways
 
+			cfgCache := make(map[string]*config.Config)
+			for _, cfg := range builder.push.GetGateways() {
+				fullName := fmt.Sprintf("%s/%s", cfg.Namespace, cfg.Name)
+				cfgCache[fullName] = &cfg
+			}
+			log.Debugf("buildCfgCache: %v", len(cfgCache))
+
 			var newFilterChains []istionetworking.FilterChain
 			switch transport {
 			case istionetworking.TransportProtocolTCP:
-				newFilterChains = configgen.buildGatewayTCPBasedFilterChains(builder, p, port, opts, serversForPort, proxyConfig, mergedGateway, tlsHostsByPort)
+				newFilterChains = configgen.buildGatewayTCPBasedFilterChains(builder, p, port, opts, serversForPort, proxyConfig, mergedGateway, tlsHostsByPort, cfgCache)
 			case istionetworking.TransportProtocolQUIC:
 				// Currently, we just assume that QUIC is HTTP/3 although that does not
 				// have to be the case (it is just the most common case now, in the future
@@ -316,11 +330,14 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 			ml.mutable.Listener.GetName(), len(ml.mutable.Listener.GetFilterChains()))
 
 		// Filters are serialized one time into an opaque struct once we have the complete list.
-		if err := ml.mutable.build(builder, *ml.opts); err != nil {
+		var http_listener [][]*envoyfilter.MessageIndex
+		var err error
+		if http_listener, err = ml.mutable.build(builder, *ml.opts); err != nil {
 			errs = multierror.Append(errs, fmt.Errorf("gateway omitting listener %q due to: %v", ml.mutable.Listener.Name, err.Error()))
 			continue
 		}
 		listeners = append(listeners, ml.mutable.Listener)
+		http_listeners = append(http_listeners, http_listener)
 
 		if features.EnableLDSCaching {
 			listenerCache := &ListenerCache{
@@ -349,10 +366,9 @@ func (configgen *ConfigGeneratorImpl) buildGatewayListeners(builder *ListenerBui
 	}
 
 	builder.gatewayListeners = listeners
+	builder.filterMassageSets = http_listeners
 	return builder, cacheStats{hits: hit, miss: miss}
 }
-
-// End modified by Higress
 
 func (configgen *ConfigGeneratorImpl) buildGatewayTCPBasedFilterChains(
 	builder *ListenerBuilder,
@@ -362,6 +378,7 @@ func (configgen *ConfigGeneratorImpl) buildGatewayTCPBasedFilterChains(
 	proxyConfig *meshconfig.ProxyConfig,
 	mergedGateway *model.MergedGateway,
 	tlsHostsByPort map[uint32]map[string]string,
+	cfgCache map[string]*config.Config,
 ) []istionetworking.FilterChain {
 	newFilterChains := make([]istionetworking.FilterChain, 0)
 	if p.IsHTTP() {
@@ -384,10 +401,12 @@ func (configgen *ConfigGeneratorImpl) buildGatewayTCPBasedFilterChains(
 		for _, server := range serversForPort.Servers {
 			if gateway.IsHTTPSServerWithTLSTermination(server) {
 				// Added by ingress
-				gatewayConfig := builder.push.GetGatewayByName(mergedGateway.GatewayNameForServer[server])
+				// gatewayConfig := builder.push.GetGatewayByName(mergedGateway.GatewayNameForServer[server])
+				gatewayConfig := cfgCache[mergedGateway.GatewayNameForServer[server]]
 				log.Debugf("[Listener] Get gatewayConfig %v", gatewayConfig)
 				extraOpts := &buildListenerFilterChainExtraOpts{
-					gatewayConfig: builder.push.GetGatewayByName(mergedGateway.GatewayNameForServer[server]),
+					// gatewayConfig: builder.push.GetGatewayByName(mergedGateway.GatewayNameForServer[server]),
+					gatewayConfig: gatewayConfig,
 					meshConfig:    builder.push.Mesh,
 					proxyConfig:   proxyConfig,
 				}
