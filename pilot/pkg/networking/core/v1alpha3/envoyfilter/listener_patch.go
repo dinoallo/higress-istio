@@ -416,9 +416,6 @@ func patchFilterChain(patchContext networking.EnvoyFilter_PatchContext,
 			// nothing more to do in other patches as we removed this filter chain
 			return
 		} else if lp.Operation == networking.EnvoyFilter_Patch_MERGE {
-			if len(lp.Value.(*listener.FilterChain).Filters) > 0 {
-				panic(fmt.Sprintf("merging filters is not supported for FilterChain %s", lis.Name))
-			}
 			merged, err := mergeTransportSocketListener(fc, lp)
 			if err != nil {
 				log.Debugf("merge of transport socket failed for listener: %v", err)
