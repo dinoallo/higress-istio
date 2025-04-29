@@ -58,6 +58,9 @@ func NewMessageIndex() *MessageIndex {
 }
 
 func (m *MessageIndex) GetMessage(entity *anypb.Any) (proto.Message, error) {
+	if m.status == Initialized {
+		return m.message, nil
+	}
 	if m.status == Uninitialized {
 		var err error
 		m.message, err = entity.UnmarshalNew()
@@ -72,9 +75,6 @@ func (m *MessageIndex) GetMessage(entity *anypb.Any) (proto.Message, error) {
 	}
 	if m.message == nil {
 		return nil, fmt.Errorf("message is nil")
-	}
-	if m.status == Initialized {
-		return m.message, nil
 	}
 	return nil, fmt.Errorf("unknown status")
 }
