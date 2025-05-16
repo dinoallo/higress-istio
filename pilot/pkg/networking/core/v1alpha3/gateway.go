@@ -309,6 +309,10 @@ func (configgen *ConfigGeneratorImpl) buildGatewayTCPBasedFilterChains(
 		// This process typically yields multiple filter chain matches (with SNI) [if TLS is used]
 		tcpFilterChainOpts := make([]*filterChainOpts, 0)
 		for _, server := range serversForPort.Servers {
+			// Skip yielding filter chains with TLS/HTTPS servers using fallback simple TLS
+			if gateway.IsHTTPSServerWithFallBackTLSTermination(server) && gateway.IsTCPServerWithFallBackTLSTermination(server) {
+				continue
+			}
 			if gateway.IsHTTPSServerWithTLSTermination(server) {
 				// Added by ingress
 				gatewayConfig := builder.push.GetGatewayByName(mergedGateway.GatewayNameForServer[server])

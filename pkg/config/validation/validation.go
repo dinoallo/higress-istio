@@ -489,6 +489,7 @@ var ValidateGateway = registerValidateFunc("ValidateGateway",
 		// Ensure unique port names
 		portNames := make(map[string]bool)
 
+		var useFallbackTlsConfig bool
 		for _, s := range value.Servers {
 			if s == nil {
 				v = appendValidation(v, fmt.Errorf("server may not be nil"))
@@ -503,10 +504,30 @@ var ValidateGateway = registerValidateFunc("ValidateGateway",
 					v = appendValidation(v, WrapWarning(fmt.Errorf("tls.httpsRedirect should only be used with http servers")))
 				}
 			}
+			if s.GetTls() != nil && s.GetTls().Mode == networking.ServerTLSSettings_FALLBACK_SIMPLE {
+				useFallbackTlsConfig = true
+			}
+		}
+		if useFallbackTlsConfig {
+			//TODO: should we validate fallback tls no matter what?
+			v = appendValidation(v, validateFallbackTLSOptions(value.GetFallbackTls()))
 		}
 
 		return v.Unwrap()
 	})
+
+func validateFallbackTLSOptions(tls *networking.ServerTLSSettings) Validation {
+	//TODO: implement me
+	var v Validation
+	if tls == nil {
+		// no tls config at all is valid
+		return v
+	}
+	if tls.Mode == networking.ServerTLSSettings_FALLBACK_SIMPLE {
+		return appendValidation(v, fmt.Errorf("falling back a fallback tls config is invalid"))
+	}
+	return validateTLSOptions(tls)
+}
 
 func validateServer(server *networking.Server) (v Validation) {
 	if server == nil {

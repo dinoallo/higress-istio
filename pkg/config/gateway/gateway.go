@@ -33,7 +33,17 @@ func IsTLSServer(server *v1alpha3.Server) bool {
 func IsHTTPSServerWithTLSTermination(server *v1alpha3.Server) bool {
 	if server.Tls != nil {
 		p := protocol.Parse(server.Port.Protocol)
-		if p == protocol.HTTPS && !IsPassThroughServer(server) {
+		if p == protocol.HTTPS && !IsFallBackSimpleServer(server) && !IsPassThroughServer(server) {
+			return true
+		}
+	}
+	return false
+}
+
+func IsHTTPSServerWithFallBackTLSTermination(server *v1alpha3.Server) bool {
+	if server.Tls != nil {
+		p := protocol.Parse(server.Port.Protocol)
+		if p == protocol.HTTPS && IsFallBackSimpleServer(server) {
 			return true
 		}
 	}
@@ -79,9 +89,31 @@ func IsPassThroughServer(server *v1alpha3.Server) bool {
 	return false
 }
 
+func IsFallBackSimpleServer(server *v1alpha3.Server) bool {
+	if server.Tls == nil {
+		return false
+	}
+
+	if server.Tls.Mode == v1alpha3.ServerTLSSettings_FALLBACK_SIMPLE {
+		return true
+	}
+
+	return false
+}
+
 // IsTCPServerWithTLSTermination returns true if this server is TCP(non-HTTP) server with some TLS settings for termination
 func IsTCPServerWithTLSTermination(server *v1alpha3.Server) bool {
-	if server.Tls != nil && !IsPassThroughServer(server) {
+	if server.Tls != nil && !IsPassThroughServer(server) && !IsFallBackSimpleServer(server) {
+		p := protocol.Parse(server.Port.Protocol)
+		if !p.IsHTTP() && !p.IsHTTPS() {
+			return true
+		}
+	}
+	return false
+}
+
+func IsTCPServerWithFallBackTLSTermination(server *v1alpha3.Server) bool {
+	if server.Tls != nil && IsFallBackSimpleServer(server) {
 		p := protocol.Parse(server.Port.Protocol)
 		if !p.IsHTTP() && !p.IsHTTPS() {
 			return true

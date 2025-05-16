@@ -1032,9 +1032,10 @@ type gatewayListenerOpts struct {
 	bind       string
 	extraBind  []string
 
-	port              *model.Port
-	filterChainOpts   []*filterChainOpts
-	needPROXYProtocol bool
+	port                   *model.Port
+	filterChainOpts        []*filterChainOpts
+	defaultFilterChainOpts *filterChainOpts
+	needPROXYProtocol      bool
 	// Added by ingrss
 	enableProxyProtocol bool
 	// End added by ingress
@@ -1050,6 +1051,26 @@ type outboundListenerOpts struct {
 
 	port    *model.Port
 	service *model.Service
+}
+
+func (f *filterChainOpts) buildTransportSocket(transport istionetworking.TransportProtocol) *core.TransportSocket {
+	var transportSocket *core.TransportSocket
+	switch transport {
+	case istionetworking.TransportProtocolTCP:
+		transportSocket = buildDownstreamTLSTransportSocket(f.tlsContext)
+	case istionetworking.TransportProtocolQUIC:
+		transportSocket = buildDownstreamQUICTransportSocket(f.tlsContext)
+	}
+	return transportSocket
+}
+
+func (f *filterChainOpts) needsTlsInspector() bool {
+	// detect ServerName or ALPN
+	needsALPN := f.tlsContext != nil && f.tlsContext.CommonTlsContext != nil && len(f.tlsContext.CommonTlsContext.AlpnProtocols) > 0
+	if len(f.sniHosts) > 0 || needsALPN {
+		return true
+	}
+	return false
 }
 
 // buildGatewayListener builds and initializes a Listener proto based on the provided opts. It does not set any filters.
@@ -1073,24 +1094,21 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 	// add a TLS inspector if we need to detect ServerName or ALPN
 	// (this is not applicable for QUIC listeners)
 	if transport == istionetworking.TransportProtocolTCP {
-		for _, chain := range opts.filterChainOpts {
-			needsALPN := chain.tlsContext != nil && chain.tlsContext.CommonTlsContext != nil && len(chain.tlsContext.CommonTlsContext.AlpnProtocols) > 0
-			if len(chain.sniHosts) > 0 || needsALPN {
-				listenerFilters = append(listenerFilters, xdsfilters.TLSInspector)
-				break
+		if opts.defaultFilterChainOpts != nil && opts.defaultFilterChainOpts.needsTlsInspector() {
+			listenerFilters = append(listenerFilters, xdsfilters.TLSInspector)
+		} else {
+			for _, chain := range opts.filterChainOpts {
+				if chain.needsTlsInspector() {
+					listenerFilters = append(listenerFilters, xdsfilters.TLSInspector)
+					break
+				}
 			}
 		}
 	}
 
 	for _, chain := range opts.filterChainOpts {
 		match := chain.toFilterChainMatch()
-		var transportSocket *core.TransportSocket
-		switch transport {
-		case istionetworking.TransportProtocolTCP:
-			transportSocket = buildDownstreamTLSTransportSocket(chain.tlsContext)
-		case istionetworking.TransportProtocolQUIC:
-			transportSocket = buildDownstreamQUICTransportSocket(chain.tlsContext)
-		}
+		transportSocket := chain.buildTransportSocket(transport)
 		filterChains = append(filterChains, &listener.FilterChain{
 			FilterChainMatch: match,
 			TransportSocket:  transportSocket,
@@ -1098,6 +1116,14 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 			// such as slow TLS Handshake attacks.
 			TransportSocketConnectTimeout: durationpb.New(defaultGatewayTransportSocketConnectTimeout),
 		})
+	}
+	var defaultFilterChain *listener.FilterChain
+	if opts.defaultFilterChainOpts != nil {
+		defaultFilterChain = &listener.FilterChain{
+			// filter_chain_match is ignore in default_filter_chain
+			TransportSocket:               opts.defaultFilterChainOpts.buildTransportSocket(transport),
+			TransportSocketConnectTimeout: durationpb.New(defaultGatewayTransportSocketConnectTimeout),
+		}
 	}
 
 	var res *listener.Listener
@@ -1122,6 +1148,7 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 			ListenerFilters:         listenerFilters,
 			FilterChains:            filterChains,
 			ConnectionBalanceConfig: connectionBalance,
+			DefaultFilterChain:      defaultFilterChain,
 			// No listener filter timeout is set for the gateway here; it will default to 15 seconds in Envoy.
 			// This timeout setting helps prevent memory leaks in Envoy when a TLS inspector filter is present,
 			// by avoiding slow requests that could otherwise lead to such issues.
@@ -1135,6 +1162,7 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 		if opts.proxy.Type != model.Router {
 			res.ListenerFiltersTimeout = opts.push.Mesh.ProtocolDetectionTimeout
 		}
+	//TODO: should I add default filter chain for quic?
 	case istionetworking.TransportProtocolQUIC:
 		// TODO: switch on TransportProtocolQUIC is in too many places now. Once this is a bit
 		//       mature, refactor some of these to an interface so that they kick off the process
@@ -1142,10 +1170,11 @@ func buildGatewayListener(opts gatewayListenerOpts, transport istionetworking.Tr
 		listenerName := getListenerName(opts.bind, opts.port.Port, istionetworking.TransportProtocolQUIC)
 		log.Debugf("buildGatewayListener: building UDP/QUIC listener %s", listenerName)
 		res = &listener.Listener{
-			Name:             listenerName,
-			Address:          util.BuildNetworkAddress(opts.bind, uint32(opts.port.Port), istionetworking.TransportProtocolQUIC),
-			TrafficDirection: core.TrafficDirection_OUTBOUND,
-			FilterChains:     filterChains,
+			Name:               listenerName,
+			Address:            util.BuildNetworkAddress(opts.bind, uint32(opts.port.Port), istionetworking.TransportProtocolQUIC),
+			TrafficDirection:   core.TrafficDirection_OUTBOUND,
+			FilterChains:       filterChains,
+			DefaultFilterChain: defaultFilterChain,
 			UdpListenerConfig: &listener.UdpListenerConfig{
 				// TODO: Maybe we should add options in MeshConfig to
 				//       configure QUIC options - it should look similar
