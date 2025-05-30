@@ -57,6 +57,7 @@ type ListenerBuilder struct {
 	node              *model.Proxy
 	push              *model.PushContext
 	gatewayListeners  []*listener.Listener
+	filterMassageSets [][][]*envoyfilter.MessageIndex // Modified by Sealos
 	inboundListeners  []*listener.Listener
 	outboundListeners []*listener.Listener
 	// HttpProxyListener is a specialize outbound listener. See MeshConfig.proxyHttpPort
@@ -159,12 +160,13 @@ func (lb *ListenerBuilder) buildVirtualOutboundListener() *ListenerBuilder {
 	return lb
 }
 
-func (lb *ListenerBuilder) patchOneListener(l *listener.Listener, ctx networking.EnvoyFilter_PatchContext) *listener.Listener {
+func (lb *ListenerBuilder) patchOneListener(l *listener.Listener, ctx networking.EnvoyFilter_PatchContext, userMgrs map[networking.EnvoyFilter_ApplyTo][]*envoyfilter.MessageIndex) *listener.Listener {
 	if l == nil {
 		return nil
 	}
 	tempArray := []*listener.Listener{l}
-	tempArray = envoyfilter.ApplyListenerPatches(ctx, lb.envoyFilterWrapper, tempArray, true)
+	messageSets := envoyfilter.MakeMessageIndexForListener(tempArray)
+	tempArray = envoyfilter.ApplyListenerPatches(ctx, lb.envoyFilterWrapper, tempArray, true, messageSets, userMgrs)
 	// temp array will either be empty [if virtual listener was removed] or will have a modified listener
 	if len(tempArray) == 0 {
 		return nil
@@ -178,17 +180,21 @@ func (lb *ListenerBuilder) patchListeners() {
 		return
 	}
 
+	userMgrs := envoyfilter.MakeMessageIndexForPatch(lb.envoyFilterWrapper.Patches)
+
 	if lb.node.Type == model.Router {
 		lb.gatewayListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_GATEWAY, lb.envoyFilterWrapper,
-			lb.gatewayListeners, false)
+			lb.gatewayListeners, false, lb.filterMassageSets, userMgrs)
 		return
 	}
 
-	lb.virtualOutboundListener = lb.patchOneListener(lb.virtualOutboundListener, networking.EnvoyFilter_SIDECAR_OUTBOUND)
-	lb.virtualInboundListener = lb.patchOneListener(lb.virtualInboundListener, networking.EnvoyFilter_SIDECAR_INBOUND)
-	lb.httpProxyListener = lb.patchOneListener(lb.httpProxyListener, networking.EnvoyFilter_SIDECAR_OUTBOUND)
-	lb.inboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_INBOUND, lb.envoyFilterWrapper, lb.inboundListeners, false)
-	lb.outboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_OUTBOUND, lb.envoyFilterWrapper, lb.outboundListeners, false)
+	lb.virtualOutboundListener = lb.patchOneListener(lb.virtualOutboundListener, networking.EnvoyFilter_SIDECAR_OUTBOUND, userMgrs)
+	lb.virtualInboundListener = lb.patchOneListener(lb.virtualInboundListener, networking.EnvoyFilter_SIDECAR_INBOUND, userMgrs)
+	lb.httpProxyListener = lb.patchOneListener(lb.httpProxyListener, networking.EnvoyFilter_SIDECAR_OUTBOUND, userMgrs)
+	InboundMessageSets := envoyfilter.MakeMessageIndexForListener(lb.inboundListeners)
+	lb.inboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_INBOUND, lb.envoyFilterWrapper, lb.inboundListeners, false, InboundMessageSets, userMgrs)
+	OutboundMessageSets := envoyfilter.MakeMessageIndexForListener(lb.outboundListeners)
+	lb.outboundListeners = envoyfilter.ApplyListenerPatches(networking.EnvoyFilter_SIDECAR_OUTBOUND, lb.envoyFilterWrapper, lb.outboundListeners, false, OutboundMessageSets, userMgrs)
 }
 
 func (lb *ListenerBuilder) getListeners() []*listener.Listener {

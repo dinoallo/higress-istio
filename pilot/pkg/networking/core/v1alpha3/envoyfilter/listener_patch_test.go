@@ -2288,8 +2288,10 @@ func TestApplyListenerPatches(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			messageSets := MakeMessageIndexForListener(tt.args.listeners)
+			userMgrs := MakeMessageIndexForPatch(tt.args.push.EnvoyFilters(tt.args.proxy).Patches)
 			got := ApplyListenerPatches(tt.args.patchContext, tt.args.push.EnvoyFilters(tt.args.proxy),
-				tt.args.listeners, tt.args.skipAdds)
+				tt.args.listeners, tt.args.skipAdds, messageSets, userMgrs)
 			if diff := cmp.Diff(tt.want, got, protocmp.Transform()); diff != "" {
 				t.Errorf("ApplyListenerPatches(): %s mismatch (-want +got):\n%s", tt.name, diff)
 			}

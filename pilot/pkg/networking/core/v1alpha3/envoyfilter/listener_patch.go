@@ -32,12 +32,109 @@ import (
 	"istio.io/istio/pkg/proto/merge"
 )
 
+// Modified by Sealos
+
+type MessageStatus int
+
+const (
+	// uninitialized is the default status for a message
+	Uninitialized MessageStatus = 0
+	// initialized is the status for a message that has been initialized
+	Initialized MessageStatus = 1
+	// failed is the status for a message that has failed to initialize
+	Failed MessageStatus = 2
+)
+
+type MessageIndex struct {
+	status  MessageStatus
+	message proto.Message
+}
+
+func NewMessageIndex() *MessageIndex {
+	return &MessageIndex{
+		status:  Uninitialized,
+		message: nil,
+	}
+}
+
+func (m *MessageIndex) GetMessage(entity *anypb.Any) (proto.Message, error) {
+	if m.status == Initialized {
+		return m.message, nil
+	}
+	if m.status == Uninitialized {
+		var err error
+		m.message, err = entity.UnmarshalNew()
+		if err != nil {
+			m.status = Failed
+			return nil, err
+		}
+		m.status = Initialized
+	}
+	if m.status == Failed {
+		return nil, fmt.Errorf("failed to initialize message")
+	}
+	if m.message == nil {
+		return nil, fmt.Errorf("message is nil")
+	}
+	return nil, fmt.Errorf("unknown status")
+}
+
+func (m *MessageIndex) ToAny(entity *anypb.Any) (*anypb.Any, error) {
+	if m.status == Uninitialized {
+		return nil, fmt.Errorf("message is not initialized")
+	}
+	if m.status == Failed {
+		return nil, fmt.Errorf("message has failed")
+	}
+	if m.message == nil {
+		return nil, fmt.Errorf("message is nil")
+	}
+	return protoconv.MessageToAny(m.message), nil
+}
+
+func MakeMessageIndexForPatch(patches map[networking.EnvoyFilter_ApplyTo][]*model.EnvoyFilterConfigPatchWrapper,
+) map[networking.EnvoyFilter_ApplyTo][]*MessageIndex {
+	mgrs := make(map[networking.EnvoyFilter_ApplyTo][]*MessageIndex)
+	for t := range patches {
+		mgrs[t] = make([]*MessageIndex, 0)
+		for i := 0; i < len(patches[t]); i++ {
+			mgrs[t] = append(mgrs[t], NewMessageIndex())
+		}
+	}
+	return mgrs
+}
+
+func MakeMessageIndexForListener(lis []*listener.Listener) [][][]*MessageIndex {
+	messageSets := make([][][]*MessageIndex, 0)
+	for _, l := range lis {
+		messageSet := make([][]*MessageIndex, 0)
+		for _, fc := range l.FilterChains {
+			messages := make([]*MessageIndex, 0)
+			if fc.Filters != nil {
+				for i := 0; i < len(fc.Filters); i++ {
+					messages = append(messages, NewMessageIndex())
+				}
+				messageSet = append(messageSet, messages)
+			} else {
+				messageSet = append(messageSet, messages)
+			}
+		}
+		messageSets = append(messageSets, messageSet)
+	}
+	return messageSets
+}
+
+// End modified by Sealos
+
 // ApplyListenerPatches applies patches to LDS output
+
 func ApplyListenerPatches(
 	patchContext networking.EnvoyFilter_PatchContext,
 	efw *model.EnvoyFilterWrapper,
 	lis []*listener.Listener,
 	skipAdds bool,
+	messageSets [][][]*MessageIndex,
+	userMgrs map[networking.EnvoyFilter_ApplyTo][]*MessageIndex,
 ) (out []*listener.Listener) {
 	defer runtime.HandleCrash(runtime.LogPanic, func(any) {
 		IncrementEnvoyFilterErrorMetric(Listener)
@@ -50,7 +147,7 @@ func ApplyListenerPatches(
 		return
 	}
 
-	return patchListeners(patchContext, efw, lis, skipAdds)
+	return patchListeners(patchContext, efw, lis, skipAdds, messageSets, userMgrs)
 }
 
 func patchListeners(
@@ -58,6 +155,8 @@ func patchListeners(
 	efw *model.EnvoyFilterWrapper,
 	listeners []*listener.Listener,
 	skipAdds bool,
+	messageSets [][][]*MessageIndex,
+	userMgrs map[networking.EnvoyFilter_ApplyTo][]*MessageIndex,
 ) []*listener.Listener {
 	listenersRemoved := false
 
@@ -65,12 +164,12 @@ func patchListeners(
 	// then move on to the next one
 
 	// only removes/merges plus next level object operations [add/remove/merge]
-	for _, lis := range listeners {
+	for i, lis := range listeners {
 		if lis.Name == "" {
 			// removed by another op
 			continue
 		}
-		patchListener(patchContext, efw.Patches, lis, &listenersRemoved)
+		patchListener(patchContext, efw.Patches, lis, &listenersRemoved, messageSets[i], userMgrs)
 	}
 	// adds at listener level if enabled
 	if !skipAdds {
@@ -107,6 +206,8 @@ func patchListeners(
 func patchListener(patchContext networking.EnvoyFilter_PatchContext,
 	patches map[networking.EnvoyFilter_ApplyTo][]*model.EnvoyFilterConfigPatchWrapper,
 	lis *listener.Listener, listenersRemoved *bool,
+	messageSet [][]*MessageIndex,
+	userMgrs map[networking.EnvoyFilter_ApplyTo][]*MessageIndex,
 ) {
 	for _, lp := range patches[networking.EnvoyFilter_LISTENER] {
 		if !commonConditionMatch(patchContext, lp) ||
@@ -122,10 +223,25 @@ func patchListener(patchContext networking.EnvoyFilter_PatchContext,
 			return
 		} else if lp.Operation == networking.EnvoyFilter_Patch_MERGE {
 			merge.Merge(lis, lp.Value)
+			for j, fc := range lis.FilterChains {
+				if j < len(messageSet) {
+					// TODO: check if in right order
+				} else {
+					messages := make([]*MessageIndex, 0)
+					if fc.Filters != nil {
+						for i := 0; i < len(fc.Filters); i++ {
+							messages = append(messages, NewMessageIndex())
+						}
+						messageSet = append(messageSet, messages)
+					} else {
+						messageSet = append(messageSet, messages)
+					}
+				}
+			}
 		}
 	}
 	patchListenerFilters(patchContext, patches[networking.EnvoyFilter_LISTENER_FILTER], lis)
-	patchFilterChains(patchContext, patches, lis)
+	patchFilterChains(patchContext, patches, lis, messageSet, userMgrs)
 }
 
 // patchListenerFilters patches passed in listener filters with listener filter patches.
@@ -233,17 +349,26 @@ func patchListenerFilters(patchContext networking.EnvoyFilter_PatchContext,
 func patchFilterChains(patchContext networking.EnvoyFilter_PatchContext,
 	patches map[networking.EnvoyFilter_ApplyTo][]*model.EnvoyFilterConfigPatchWrapper,
 	lis *listener.Listener,
+	messageSets [][]*MessageIndex,
+	userMgrs map[networking.EnvoyFilter_ApplyTo][]*MessageIndex,
 ) {
 	filterChainsRemoved := false
 	for i, fc := range lis.FilterChains {
 		if fc.Filters == nil {
 			continue
 		}
-		patchFilterChain(patchContext, patches, lis, lis.FilterChains[i], &filterChainsRemoved)
+		patchFilterChain(patchContext, patches, lis, lis.FilterChains[i], &filterChainsRemoved, messageSets[i], userMgrs)
 	}
 	if fc := lis.GetDefaultFilterChain(); fc.GetFilters() != nil {
 		removed := false
-		patchFilterChain(patchContext, patches, lis, fc, &removed)
+
+		ms := make([]*MessageIndex, 0)
+		for i := 0; i < len(fc.Filters); i++ {
+			ms = append(ms, NewMessageIndex())
+		}
+		// TODO: change this to use the patchFilterChainExt function
+		patchFilterChain(patchContext, patches, lis, fc, &removed, ms, userMgrs)
+
 		if removed {
 			lis.DefaultFilterChain = nil
 		}
@@ -274,6 +399,8 @@ func patchFilterChain(patchContext networking.EnvoyFilter_PatchContext,
 	patches map[networking.EnvoyFilter_ApplyTo][]*model.EnvoyFilterConfigPatchWrapper,
 	lis *listener.Listener,
 	fc *listener.FilterChain, filterChainRemoved *bool,
+	mgrs []*MessageIndex,
+	userMgrs map[networking.EnvoyFilter_ApplyTo][]*MessageIndex,
 ) {
 	for _, lp := range patches[networking.EnvoyFilter_FILTER_CHAIN] {
 		if !commonConditionMatch(patchContext, lp) ||
@@ -296,10 +423,17 @@ func patchFilterChain(patchContext networking.EnvoyFilter_PatchContext,
 			}
 			if !merged {
 				merge.Merge(fc, lp.Value)
+				for i, _ := range fc.Filters {
+					if i < len(mgrs) {
+						// TODO: check if in right order
+					} else {
+						mgrs = append(mgrs, NewMessageIndex())
+					}
+				}
 			}
 		}
 	}
-	patchNetworkFilters(patchContext, patches, lis, fc)
+	patchNetworkFilters(patchContext, patches, lis, fc, mgrs, userMgrs)
 }
 
 // Test if the patch contains a config for TransportSocket
@@ -347,6 +481,8 @@ func mergeTransportSocketListener(fc *listener.FilterChain, lp *model.EnvoyFilte
 func patchNetworkFilters(patchContext networking.EnvoyFilter_PatchContext,
 	patches map[networking.EnvoyFilter_ApplyTo][]*model.EnvoyFilterConfigPatchWrapper,
 	lis *listener.Listener, fc *listener.FilterChain,
+	mgrs []*MessageIndex,
+	userMgrs map[networking.EnvoyFilter_ApplyTo][]*MessageIndex,
 ) {
 	for _, lp := range patches[networking.EnvoyFilter_NETWORK_FILTER] {
 		if !commonConditionMatch(patchContext, lp) ||
@@ -358,9 +494,11 @@ func patchNetworkFilters(patchContext networking.EnvoyFilter_PatchContext,
 		applied := false
 		if lp.Operation == networking.EnvoyFilter_Patch_ADD {
 			fc.Filters = append(fc.Filters, proto.Clone(lp.Value).(*listener.Filter))
+			mgrs = append(mgrs, NewMessageIndex())
 			applied = true
 		} else if lp.Operation == networking.EnvoyFilter_Patch_INSERT_FIRST {
 			fc.Filters = append([]*listener.Filter{proto.Clone(lp.Value).(*listener.Filter)}, fc.Filters...)
+			mgrs = append([]*MessageIndex{NewMessageIndex()}, mgrs...)
 			applied = true
 		} else if lp.Operation == networking.EnvoyFilter_Patch_INSERT_AFTER {
 			// Insert after without a filter match is same as ADD in the end
@@ -384,8 +522,13 @@ func patchNetworkFilters(patchContext networking.EnvoyFilter_PatchContext,
 			clonedVal := proto.Clone(lp.Value).(*listener.Filter)
 			fc.Filters = append(fc.Filters, clonedVal)
 			if insertPosition < len(fc.Filters)-1 {
+				mgrs = append(mgrs, nil)
 				copy(fc.Filters[insertPosition+1:], fc.Filters[insertPosition:])
+				copy(mgrs[insertPosition+1:], mgrs[insertPosition:])
 				fc.Filters[insertPosition] = clonedVal
+				mgrs[insertPosition] = NewMessageIndex()
+			} else {
+				mgrs = append(mgrs, NewMessageIndex())
 			}
 		} else if lp.Operation == networking.EnvoyFilter_Patch_INSERT_BEFORE {
 			// insert before without a filter match is same as insert in the beginning
@@ -409,8 +552,11 @@ func patchNetworkFilters(patchContext networking.EnvoyFilter_PatchContext,
 			applied = true
 			clonedVal := proto.Clone(lp.Value).(*listener.Filter)
 			fc.Filters = append(fc.Filters, clonedVal)
+			mgrs = append(mgrs, nil)
 			copy(fc.Filters[insertPosition+1:], fc.Filters[insertPosition:])
+			copy(mgrs[insertPosition+1:], mgrs[insertPosition:])
 			fc.Filters[insertPosition] = clonedVal
+			mgrs[insertPosition] = NewMessageIndex()
 		} else if lp.Operation == networking.EnvoyFilter_Patch_REPLACE {
 			if !hasNetworkFilterMatch(lp) {
 				continue
@@ -428,26 +574,32 @@ func patchNetworkFilters(patchContext networking.EnvoyFilter_PatchContext,
 			}
 			applied = true
 			fc.Filters[replacePosition] = proto.Clone(lp.Value).(*listener.Filter)
+			mgrs[replacePosition] = NewMessageIndex()
 		} else if lp.Operation == networking.EnvoyFilter_Patch_REMOVE {
 			if !hasNetworkFilterMatch(lp) {
 				continue
 			}
 
 			var tempFilters []*listener.Filter
-			for _, filter := range fc.Filters {
+			var tempMgrs []*MessageIndex
+			for j, filter := range fc.Filters {
 				if !networkFilterMatch(filter, lp) {
 					tempFilters = append(tempFilters, filter)
+					tempMgrs = append(tempMgrs, mgrs[j])
 				}
 			}
 			fc.Filters = tempFilters
+			mgrs = tempMgrs
 		}
 		IncrementEnvoyFilterMetric(lp.Key(), NetworkFilter, applied)
 	}
 
 	for i := range fc.Filters {
-		patchNetworkFilter(patchContext, patches, lis, fc, fc.Filters[i])
+		patchNetworkFilter(patchContext, patches, lis, fc, fc.Filters[i], mgrs[i], userMgrs)
 	}
 }
+
+// End modified by Sealos
 
 // patchNetworkFilter patches passed in filter if it is MERGE operation.
 // The return value indicates whether the filter has been removed for REMOVE operations.
@@ -455,8 +607,10 @@ func patchNetworkFilter(patchContext networking.EnvoyFilter_PatchContext,
 	patches map[networking.EnvoyFilter_ApplyTo][]*model.EnvoyFilterConfigPatchWrapper,
 	lis *listener.Listener, fc *listener.FilterChain,
 	filter *listener.Filter,
+	mgr *MessageIndex,
+	userMgrs map[networking.EnvoyFilter_ApplyTo][]*MessageIndex,
 ) {
-	for _, lp := range patches[networking.EnvoyFilter_NETWORK_FILTER] {
+	for i, lp := range patches[networking.EnvoyFilter_NETWORK_FILTER] {
 		if !commonConditionMatch(patchContext, lp) ||
 			!listenerMatch(lis, lp) ||
 			!filterChainMatch(lis, fc, lp) ||
@@ -476,14 +630,14 @@ func patchNetworkFilter(patchContext networking.EnvoyFilter_PatchContext,
 				continue
 			}
 			userFilter := lp.Value.(*listener.Filter)
-			var err error
+			// var err error
 			// we need to be able to overwrite filter names or simply empty out a filter's configs
 			// as they could be supplied through per route filter configs
 			filterName := filter.Name
 			if userFilter.Name != "" {
 				filterName = userFilter.Name
 			}
-			var retVal *anypb.Any
+			// var retVal *anypb.Any
 			if userFilter.GetTypedConfig() != nil {
 				IncrementEnvoyFilterMetric(lp.Key(), NetworkFilter, true)
 				// user has any typed struct
@@ -494,32 +648,49 @@ func patchNetworkFilter(patchContext networking.EnvoyFilter_PatchContext,
 				if userFilter.GetTypedConfig().TypeUrl != filter.GetTypedConfig().TypeUrl {
 					userFilter.ConfigType.(*listener.Filter_TypedConfig).TypedConfig.TypeUrl = filter.GetTypedConfig().TypeUrl
 				}
-				if retVal, err = util.MergeAnyWithAny(filter.GetTypedConfig(), userFilter.GetTypedConfig()); err != nil {
-					retVal = filter.GetTypedConfig()
+				r1, e1 := mgr.GetMessage(filter.GetTypedConfig())
+				r2, e2 := userMgrs[networking.EnvoyFilter_NETWORK_FILTER][i].GetMessage(userFilter.GetTypedConfig())
+				if e1 == nil || e2 == nil {
+					merge.Merge(r1, r2)
 				}
 			}
 			filter.Name = filterName
-			if retVal != nil {
-				filter.ConfigType = &listener.Filter_TypedConfig{TypedConfig: retVal}
-			}
 		}
 	}
 	if filter.Name == wellknown.HTTPConnectionManager {
-		patchHTTPFilters(patchContext, patches, lis, fc, filter)
+		patchHTTPFilters(patchContext, patches, lis, fc, filter, mgr)
+	}
+	if filter.GetTypedConfig() != nil {
+		config, err := mgr.ToAny(filter.GetTypedConfig())
+		if err == nil {
+			// convert to any type
+			filter.ConfigType = &listener.Filter_TypedConfig{TypedConfig: config}
+		} else {
+			log.Debugf("failed to convert filter config to any type: %v", err)
+		}
 	}
 }
+
+// End modified by Sealos
 
 func patchHTTPFilters(patchContext networking.EnvoyFilter_PatchContext,
 	patches map[networking.EnvoyFilter_ApplyTo][]*model.EnvoyFilterConfigPatchWrapper,
 	lis *listener.Listener, fc *listener.FilterChain, filter *listener.Filter,
+	mgr *MessageIndex,
 ) {
-	httpconn := &hcm.HttpConnectionManager{}
-	if filter.GetTypedConfig() != nil {
-		if err := filter.GetTypedConfig().UnmarshalTo(httpconn); err != nil {
-			return
-			// todo: figure out a non noisy logging option here
-			//  as this loop will be called very frequently
-		}
+	if mgr == nil {
+		log.Debugf("EnvoyFilter patch %v is not applied because no matching HTTP filter found.", patches[networking.EnvoyFilter_HTTP_FILTER])
+		return
+	}
+	msg, err := mgr.GetMessage(filter.GetTypedConfig())
+	if err != nil {
+		log.Debugf("EnvoyFilter patch %v is not applied because no matching HTTP filter found.", patches[networking.EnvoyFilter_HTTP_FILTER])
+		return
+	}
+	httpconn, ok := msg.(*hcm.HttpConnectionManager)
+	if !ok {
+		log.Debugf("EnvoyFilter patch %v is not applied because no matching HTTP filter found.", patches[networking.EnvoyFilter_HTTP_FILTER])
+		return
 	}
 	for _, lp := range patches[networking.EnvoyFilter_HTTP_FILTER] {
 		applied := false
@@ -622,11 +793,9 @@ func patchHTTPFilters(patchContext networking.EnvoyFilter_PatchContext,
 	for _, httpFilter := range httpconn.HttpFilters {
 		patchHTTPFilter(patchContext, patches, lis, fc, filter, httpFilter)
 	}
-	if filter.GetTypedConfig() != nil {
-		// convert to any type
-		filter.ConfigType = &listener.Filter_TypedConfig{TypedConfig: protoconv.MessageToAny(httpconn)}
-	}
 }
+
+// End modified by Sealos
 
 // patchHTTPFilter patches passed in filter if it is MERGE operation.
 // The return value indicates whether the filter has been removed for REMOVE operations.
