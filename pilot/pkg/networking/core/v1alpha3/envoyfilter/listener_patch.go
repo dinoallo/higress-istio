@@ -650,8 +650,15 @@ func patchNetworkFilter(patchContext networking.EnvoyFilter_PatchContext,
 				}
 				r1, e1 := mgr.GetMessage(filter.GetTypedConfig())
 				r2, e2 := userMgrs[networking.EnvoyFilter_NETWORK_FILTER][i].GetMessage(userFilter.GetTypedConfig())
-				if e1 == nil || e2 == nil {
+				if e1 == nil && e2 == nil {
 					merge.Merge(r1, r2)
+				} else {
+					if e1 != nil {
+						log.Debugf("failed to get message for filter %s: %v", filter.Name, e1)
+					}
+					if e2 != nil {
+						log.Debugf("failed to get message for user filter %s: %v", userFilter.Name, e2)
+					}
 				}
 			}
 			filter.Name = filterName
