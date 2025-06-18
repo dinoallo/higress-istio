@@ -69,6 +69,7 @@ func (m *MessageIndex) GetMessage(entity *anypb.Any) (proto.Message, error) {
 			return nil, err
 		}
 		m.status = Initialized
+		return m.message, nil
 	}
 	if m.status == Failed {
 		return nil, fmt.Errorf("failed to initialize message")
